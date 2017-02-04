@@ -37,6 +37,47 @@ def categorical_crossentropy(y_true, y_pred):
     return K.categorical_crossentropy(y_pred, y_true)
 
 
+def unnormalized_categorical_crossentropy(y_true, y_pred):
+    """
+    Implements in a numerically-stable manner a combined softmax and cross-
+    entropy. Accepts unnormalized predictions y_pred and a probability
+    distribution y_true. y_pred and y_true must be of the same shape and at
+    least 2D; the last dimension must be the probability distribution and all
+    others are batch dimensions.
+
+    CE                   = -sum(log(softmax(y_pred)) * y_true, axis="all ~0")
+    softmax(y_pred)      = exp(y_pred) / sum(exp(y_pred), axis=-1)
+    log(softmax(y_pred)) = log(exp(y_pred) / sum(exp(y_pred), axis=-1))
+                         = y_pred - log(sum(exp(y_pred), axis=-1))
+
+    The input y_pred must be stabilized. This can be done by shifting it such
+    that its maximum value is 0 and minimum is some low value (e.g. 30% of
+    -log(MAX_VAL)).
+    """
+
+    # Floating-point preparations
+    import numpy as np
+    y       = y_pred                                  # Alias
+    fMaxVal = np.finfo(y.dtype).max                   # Get dtype's MAXVAL
+    fMinVal = np.finfo(y.dtype).min                   # Get dtype's MINVAL
+    thresh  = -0.3 * np.log(fMaxVal)                  # Set a threshold at 30% of
+                                                      # underflow value for exp().
+
+    # Stabilization of y_pred
+    y       = K.maximum(y, fMinVal)                   # NaNs and -Inf -> MINVAL
+    y       = K.minimum(y, fMaxVal)                   # +Inf          -> MAXVAL
+    y      -= K.max    (y, axis=-1, keepdims=True)    # Stabilize y s.t. max(y) == 0
+    y       = K.maximum(y,  thresh)                   # Prevent underflow by clamping.
+
+    # Numerically stable logsoftmax
+    expy    = K.exp    (y)                            # Exponential of y
+    sumexpy = K.sum    (expy, axis=-1, keepdims=True) # Sum of exponentials
+    y      -= K.log    (sumexpy)                      # Logsoftmax.
+
+    # Cross-entropy
+    return -K.sum(y*y_true, axis=range(1, y.ndim))    # Sum out all axes ~0.
+
+
 def sparse_categorical_crossentropy(y_true, y_pred):
     return K.sparse_categorical_crossentropy(y_pred, y_true)
 

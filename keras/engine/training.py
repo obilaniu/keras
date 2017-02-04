@@ -671,7 +671,7 @@ class Model(Container):
             if total_loss is None:
                 total_loss = loss_weight * output_loss
             else:
-                total_loss += loss_weight * output_loss
+                total_loss += loss_weight * output_loss 
 
         # add regularization penalties
         # and other layer-specific losses
@@ -732,6 +732,7 @@ class Model(Container):
         # This saves time when the user is not using all functions.
         self._function_kwargs = kwargs
 
+        self.autotune_function = None
         self.train_function = None
         self.test_function = None
         self.predict_function = None
@@ -745,6 +746,64 @@ class Model(Container):
             else:
                 trainable_weights.sort(key=lambda x: x.name)
         self._collected_trainable_weights = trainable_weights
+
+        # Collect probes and sort them deterministically.
+        probes = self.probes
+        # Sort probes by name
+        if trainable_weights:
+            if K.backend() == 'theano':
+                probes.sort(key=lambda x: x.gain.name if x.gain.name else x.gain.auto_name)
+            else:
+                probes.sort(key=lambda x: x.gain.name)
+        self._collected_probes = probes
+
+    def _make_autotune_function(self):
+        if not hasattr(self, 'autotune_function'):
+            raise RuntimeError('You must compile your model before using it.')
+        if self.autotune_function is None:
+            #
+            # Create the learning-phase toggle.
+            #
+            if self.uses_learning_phase and not isinstance(K.learning_phase(), int):
+                inputs = self.inputs + self.targets + self.sample_weights + [K.learning_phase()]
+            else:
+                inputs = self.inputs + self.targets + self.sample_weights
+            
+            #
+            # Gain controls to update
+            #
+            params           = [p.gain for p in self._collected_probes]
+            
+            #
+            # @-factor
+            #
+            self.at_factor   = K.zeros(())
+            penalties        = []
+            mags             = []
+            training_updates = []
+            for p in self._collected_probes:
+                target = p.target
+                if   p.isFw():
+                    val     = p.v
+                elif p.isBw():
+                    val     = K.gradients(self.total_loss, p.v)
+                stddev            = K.std(val)
+                activity          = stddev/target
+                #penalty           = K.square(K.log(1.0 * (activity + K.epsilon()))) + \
+                #                    K.square(K.log(1.0 / (activity + K.epsilon())))
+                penalty           = K.square(1.0-activity)
+                penalties        += [penalty]
+                mags             += [K.sqrt(K.sum(val**2))]
+                self.at_factor   +=  penalty
+                
+                training_updates += [(p.gain, K.abs(p.gain - 0.01*(2*activity - 2) - 0.0001*(2*p.gain - 2)))]
+            updates = self.state_updates + training_updates
+
+            # Returns @ factor. Updates gains at each call.
+            self.autotune_function = K.function(inputs,
+                                                [self.at_factor] + penalties + mags,
+                                                updates=updates,
+                                                **self._function_kwargs)
 
     def _make_train_function(self):
         if not hasattr(self, 'train_function'):
@@ -1271,6 +1330,57 @@ class Model(Container):
         return self._predict_loop(f, ins,
                                   batch_size=batch_size, verbose=verbose)
 
+    def autotune_on_batch(self, x, y,
+                          sample_weight=None, class_weight=None):
+        """Runs a single autotune update on a single batch of data.
+    
+        # Arguments
+            x: Numpy array of training data,
+                or list of Numpy arrays if the model has multiple inputs.
+                If all inputs in the model are named,
+                you can also pass a dictionary
+                mapping input names to Numpy arrays.
+            y: Numpy array of target data,
+                or list of Numpy arrays if the model has multiple outputs.
+                If all outputs in the model are named,
+                you can also pass a dictionary
+                mapping output names to Numpy arrays.
+            sample_weight: optional array of the same length as x, containing
+                weights to apply to the model's loss for each sample.
+                In the case of temporal data, you can pass a 2D array
+                with shape (samples, sequence_length),
+                to apply a different weight to every timestep of every sample.
+                In this case you should make sure to specify
+                sample_weight_mode="temporal" in compile().
+            class_weight: optional dictionary mapping
+                lass indices (integers) to
+                a weight (float) to apply to the model's loss for the samples
+                from this class during training.
+                This can be useful to tell the model to "pay more attention" to
+                samples from an under-represented class.
+    
+        # Returns
+            Scalar training loss
+            (if the model has a single output and no metrics)
+            or list of scalars (if the model has multiple outputs
+            and/or metrics). The attribute `model.metrics_names` will give you
+            the display labels for the scalar outputs.
+        """
+        x, y, sample_weights = self._standardize_user_data(
+            x, y,
+            sample_weight=sample_weight,
+            class_weight=class_weight,
+            check_batch_axis=True)
+        if self.uses_learning_phase and not isinstance(K.learning_phase, int):
+            ins = x + y + sample_weights + [1.]
+        else:
+            ins = x + y + sample_weights
+        self._make_autotune_function()
+        outputs = self.autotune_function(ins)
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
+
     def train_on_batch(self, x, y,
                        sample_weight=None, class_weight=None):
         """Runs a single gradient update on a single batch of data.
@@ -1378,6 +1488,151 @@ class Model(Container):
         if len(outputs) == 1:
             return outputs[0]
         return outputs
+
+    def autotune_generator(self, generator, samples_per_epoch, nb_epoch,
+                           verbose=1, callbacks=None,
+                           class_weight=None,
+                           max_q_size=10, nb_worker=1, pickle_safe=False,
+                           initial_epoch=0):
+        """Autotunes the model on data generated batch-by-batch by
+        a Python generator.
+        The generator is run in parallel to the model, for efficiency.
+        For instance, this allows you to do real-time data augmentation
+        on images on CPU in parallel to training your model on GPU.
+
+        # Arguments
+           generator: a generator.
+               The output of the generator must be either
+               - a tuple (inputs, targets)
+               - a tuple (inputs, targets, sample_weights).
+               All arrays should contain the same number of samples.
+               The generator is expected to loop over its data
+               indefinitely. An epoch finishes when `samples_per_epoch`
+               samples have been seen by the model.
+           samples_per_epoch: integer, number of samples to process before
+               going to the next epoch.
+           nb_epoch: integer, total number of iterations on the data.
+           verbose: verbosity mode, 0, 1, or 2.
+           callbacks: list of callbacks to be called during training.
+           class_weight: dictionary mapping class indices to a weight
+               for the class.
+           max_q_size: maximum size for the generator queue
+           nb_worker: maximum number of processes to spin up
+               when using process based threading
+           pickle_safe: if True, use process based threading.
+               Note that because
+               this implementation relies on multiprocessing,
+               you should not pass
+               non picklable arguments to the generator
+               as they can't be passed
+               easily to children processes.
+           initial_epoch: epoch at which to start training
+               (useful for resuming a previous training run)
+
+        # Returns
+           A `History` object.
+
+        # Example
+
+        ```python
+           def generate_arrays_from_file(path):
+               while 1:
+                   f = open(path)
+                   for line in f:
+                       # create numpy arrays of input data
+                       # and labels, from each line in the file
+                       x1, x2, y = process_line(line)
+                       yield ({'input_1': x1, 'input_2': x2}, {'output': y})
+                   f.close()
+
+           model.autotune_generator(generate_arrays_from_file('/my_file.txt'),
+                                    samples_per_epoch=10000, nb_epoch=10)
+        ```
+        """
+        wait_time = 0.01  # in seconds
+        epoch = initial_epoch
+
+        self._make_autotune_function()
+        if not self._collected_probes:
+            return
+
+        enqueuer = None
+
+        import sys
+        try:
+           enqueuer = GeneratorEnqueuer(generator, pickle_safe=pickle_safe)
+           enqueuer.start(max_q_size=max_q_size, nb_worker=nb_worker)
+
+           while epoch < nb_epoch:
+               samples_seen = 0
+               batch_index = 0
+               while samples_seen < samples_per_epoch:
+                   generator_output = None
+                   while enqueuer.is_running():
+                       if not enqueuer.queue.empty():
+                           generator_output = enqueuer.queue.get()
+                           break
+                       else:
+                           time.sleep(wait_time)
+
+                   if not hasattr(generator_output, '__len__'):
+                       raise ValueError('output of generator should be a tuple '
+                                        '(x, y, sample_weight) '
+                                        'or (x, y). Found: ' +
+                                        str(generator_output))
+                   if len(generator_output) == 2:
+                       x, y = generator_output
+                       sample_weight = None
+                   elif len(generator_output) == 3:
+                       x, y, sample_weight = generator_output
+                   else:
+                       raise ValueError('output of generator should be a tuple '
+                                        '(x, y, sample_weight) '
+                                        'or (x, y). Found: ' +
+                                        str(generator_output))
+                   batch_size = x.shape[0]
+
+                   outs = self.autotune_on_batch(x, y,
+                                                 sample_weight=sample_weight,
+                                                 class_weight=class_weight)
+
+                   if not isinstance(outs, list):
+                       outs = [outs]
+
+                   # construct epoch logs
+                   batch_index += 1
+                   samples_seen += batch_size
+
+                   # epoch finished
+                   if samples_seen > samples_per_epoch:
+                       warnings.warn('Epoch comprised more than '
+                                     '`samples_per_epoch` samples, '
+                                     'which might affect learning results. '
+                                     'Set `samples_per_epoch` correctly '
+                                     'to avoid this warning.')
+
+                   #sys.stdout.write("Autotune Loss: {:6.3f}\r".format(float(outs[0])))
+                   #sys.stdout.flush()
+                   
+                   print("Total Loss: {:6.3f}".format(float(outs[0])))
+                   numProbes = len(self._collected_probes)
+                   for p, penalty, mag in zip(self._collected_probes,
+                                              outs[1:1+numProbes],
+                                              outs[1+numProbes:]):
+                       name    = p.gain.name
+                       value   = float(K.get_value(p.gain))
+                       penalty = float(penalty)
+                       mag     = float(mag)
+                       print("Name: {:20s}    Value: {:6.3f}   #Elems: {:6d}   Penalty: {:.17f}   Mag: {:.17f}".format(name, value, p.nElems, penalty, mag))
+                   
+
+               epoch += 1
+
+        finally:
+           if enqueuer is not None:
+               enqueuer.stop()
+           sys.stdout.write("\n")
+
 
     def fit_generator(self, generator, samples_per_epoch, nb_epoch,
                       verbose=1, callbacks=None,

@@ -306,6 +306,8 @@ class Layer(object):
             self._trainable_weights = []
         if not hasattr(self, '_non_trainable_weights'):
             self._non_trainable_weights = []
+        if not hasattr(self, '_probes'):
+            self._probes = []
         if not hasattr(self, 'losses'):
             self.losses = []
         if not hasattr(self, 'constraints'):
@@ -365,6 +367,14 @@ class Layer(object):
     @non_trainable_weights.setter
     def non_trainable_weights(self, weights):
         self._non_trainable_weights = weights
+
+    @property
+    def probes(self):
+        return self._probes
+
+    @probes.setter
+    def probes(self, probes):
+        self._probes = probes
 
     @property
     def regularizers(self):
@@ -2195,6 +2205,15 @@ class Container(Layer):
                 tuples.append((sw, w))
             weights = weights[nb_param:]
         K.batch_set_value(tuples)
+
+    @property
+    def probes(self):
+        probes = []
+        for layer in self.layers:
+            if hasattr(layer, "probes"):
+                probes += layer.probes
+        
+        return probes
 
     @property
     def input_spec(self):
